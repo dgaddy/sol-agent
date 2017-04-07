@@ -198,13 +198,12 @@ class Model(object):
 
                 types[obs_num,slot_num] = slot_type.value
 
+                if len(cards) > self.max_stack_len:
+                    cards = cards[-self.max_stack_len:] # take the top cards of the stack if it is too long
                 length = len(cards)
                 lengths[obs_num,slot_num] = length
                 pos[obs_num,slot_num,:length] = range(length,0,-1) # from stack_length to 1, leaving 0 for padding
                 for card_num in range(length):
-                    if card_num >= self.max_stack_len:
-                        print('stack too large')
-                        break
                     v, s, r = cards[card_num]
                     v = int(v) + 1
                     s += 1
@@ -239,29 +238,28 @@ class Model(object):
     def update_target(self, session):
         session.run(self.update_target_fn)
 
-def card_count(obs):
-    n = 0
-    for slot in obs:
-        n += len(slot[1])
-    return n
+    def valid_action_mask(self, obs):
+        # avoid trying to drag where there is no card; doesn't mean the move is actually valid
+        card_mask = np.zeros((self.n_slots,self.max_stack_len))
+        for slot in range(self.n_slots):
+            card_mask[slot,:len(obs[slot])] = 1
+        return np.concatenate((np.ones(self.n_slots*2), card_mask.flatten()))
 
 def main():
     update_freq = 4
     batch_size = 32
-    learning_starts = 50000
+    learning_starts = 500000
     max_steps = 5000000
-    max_steps_per_ep = 5000
-    buffer_size = 100000
+    max_steps_per_ep = 1000
+    buffer_size = 1000000
     init_eps = .95
-    final_eps = .01
-    final_eps_timestep = 500000
+    final_eps = .05
+    final_eps_timestep = 1000000
     target_update_freq = 10000
 
     env = sol_env.SolEnv()
     obs = env.reset()
     buff = Buffer(buffer_size)
-
-    n_cards = card_count(obs)
 
     with tf.Session() as sess:
         model = Model(len(obs),10) # TODO: max stack len?
@@ -279,11 +277,13 @@ def main():
             else:
                 eps = init_eps + (final_eps-init_eps)*t/final_eps_timestep
 
+            action_mask = model.valid_action_mask(obs)
             if t <= learning_starts or random.random() < eps:
-                action_id = random.randrange(model.n_actions())
+                action_id = (np.random.random(model.n_actions())*action_mask).argmax()
             else:
                 q_values = model.evaluate_q_values(obs, sess)
-                action_id = q_values.argmax() # XXX should we mask invalid ones?
+                q_values -= (1-action_mask)*float('inf')
+                action_id = q_values.argmax()
 
             last_obs = obs
             action = model.action_id_to_action(action_id)

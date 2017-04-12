@@ -42,7 +42,7 @@ def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, m
         rank_emb_matrix = tf.get_variable('rank_emb', [16, emb_size], tf.float32, tf.random_normal_initializer())
         rank_emb = tf.nn.embedding_lookup(rank_emb_matrix, rank_ph)
         
-        position_emb_matrix = tf.get_variable('pos_emb', [max_stack_len, emb_size], tf.float32, tf.random_normal_initializer())
+        position_emb_matrix = tf.get_variable('pos_emb', [max_stack_len+1, emb_size], tf.float32, tf.random_normal_initializer())
         pos_emb = tf.nn.embedding_lookup(position_emb_matrix, pos_ph)
 
         card_reps = tf.concat([vis_emb, suit_emb, rank_emb, pos_emb],3)
@@ -156,7 +156,7 @@ class Model(object):
 
 
     def evaluate_q_values(self, observation, session):
-        return session.run(self.q_values, feed_dict=self.feed_dict_from_obs([observation]))
+        return session.run(self.q_values, feed_dict=self.feed_dict_from_obs([observation])).squeeze()
 
     def train_step(self, samples, session):
         learning_rate = .001
@@ -282,7 +282,7 @@ def main():
                 action_id = (np.random.random(model.n_actions())*action_mask).argmax()
             else:
                 q_values = model.evaluate_q_values(obs, sess)
-                q_values -= (1-action_mask)*float('inf')
+                q_values -= (1-action_mask)*1000
                 action_id = q_values.argmax()
 
             last_obs = obs

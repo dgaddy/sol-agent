@@ -255,7 +255,7 @@ class Model(object):
         # avoid trying to drag where there is no card; doesn't mean the move is actually valid
         card_mask = np.zeros((self.n_slots,self.max_stack_len))
         for slot in range(self.n_slots):
-            card_mask[slot,:len(obs[slot])] = 1
+            card_mask[slot,:len(obs[slot][1])] = 1
         return np.concatenate((np.ones(self.n_slots*2), card_mask.flatten()))
 
 def get_initial_sample(buffer_size, env, model, max_steps_per_ep, initial_samples=500000):
@@ -287,7 +287,7 @@ def get_initial_sample(buffer_size, env, model, max_steps_per_ep, initial_sample
         return buff
              
 def main():
-    debug = False
+    debug = True
     update_freq = 4
     batch_size = 32
     max_steps = 5000000
@@ -336,15 +336,11 @@ def main():
                     card_mask = action_mask[len(obs)*2:].reshape((len(obs),10))
                     best_per_stack = card_qs.argmax(axis=1)
                     lengths = [len(s) for t,s in obs]
-                    ranks_ph = model.tmp_r[0,:,:]
-                    top_ranks = [ranks_ph[i,lengths[i]-1] for i in range(len(lengths)) if lengths[i] > 0]
-                    pos_ph = model.tmp_p[0,:,:]
-                    top_pos = [pos_ph[i,lengths[i]-1] for i in range(len(lengths)) if lengths[i] > 0]
                     print('============debug info==============')
-                    print(pos_ph)
-                    print(ranks_ph)
                     print(card_qs)
                     print(card_mask)
+                    print(best_per_stack)
+                    print(lengths)
                 
 
             last_obs = obs

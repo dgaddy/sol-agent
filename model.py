@@ -79,9 +79,9 @@ def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, m
 
         click_slot_q_values = tf.layers.conv1d(slot_hiddens, 1, 1) # size batch_size by n_slots
 
-        # TODO: include stack representations in card action eval
         context_repeated = tf.tile(tf.expand_dims(tf.expand_dims(global_context,1),1), (1, n_slots, max_stack_len, 1))
-        card_hiddens = tf.layers.conv2d(tf.concat([card_reps,context_repeated],3), hidden_size, 1)
+        slot_reps_repeated = tf.tile(tf.expand_dims(slot_reps,2), (1,1,max_stack_len,1))
+        card_hiddens = tf.layers.conv2d(tf.concat([card_reps,context_repeated,slot_reps_repeated],3), hidden_size, 1)
         
         drag_card_q_values = tf.layers.conv2d(card_hiddens, 1, 1) # size batch_size by n_slots by max_stack_len
         drop_card_q_values = tf.layers.conv1d(slot_hiddens, 1, 1)

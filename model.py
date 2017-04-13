@@ -225,7 +225,7 @@ class Model(object):
         else:
             return {self.visible_ph:visible,self.suit_ph:suit, self.rank_ph:rank, self.pos_ph:pos, self.seq_len_ph:lengths, self.type_ph:types}
 
-    def action_id_to_action(self, action_id):
+    def action_id_to_action(self, action_id, obs):
         n_slots = self.n_slots
         max_stack_len = self.max_stack_len
         if action_id < n_slots:
@@ -234,8 +234,14 @@ class Model(object):
             return sol_env.ActionType.DROP, action_id-n_slots, 0
         elif action_id < n_slots*(2+max_stack_len):
             a = (action_id-2*n_slots)
+            slot = a//max_stack_len
+            cards = obs[slot][1]
+            if len(cards) > max_stack_len:
+                extra = len(cards)-max_stack_len
+            else:
+                extra = 0
             
-            return sol_env.ActionType.DRAG, a//max_stack_len, a%max_stack_len
+            return sol_env.ActionType.DRAG, slot, a%max_stack_len+extra
         else:
             assert False # out of range
 
@@ -267,7 +273,7 @@ def get_initial_sample(buffer_size, env, model, max_steps_per_ep, initial_sample
             action_mask = model.valid_action_mask(obs)
             action_id = (np.random.random(model.n_actions())*action_mask).argmax()
             last_obs = obs
-            action = model.action_id_to_action(action_id)
+            action = model.action_id_to_action(action_id, obs)
             obs, rew, done, info = env.step(action)
 
             buff.insert((last_obs, action_id, obs, rew, done))
@@ -342,7 +348,7 @@ def main():
                 
 
             last_obs = obs
-            action = model.action_id_to_action(action_id)
+            action = model.action_id_to_action(action_id, obs)
             obs, rew, done, info = env.step(action)
             episode_reward += rew
 

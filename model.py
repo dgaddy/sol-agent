@@ -1,5 +1,8 @@
 import time
 import random
+import pickle
+import os
+import os.path as path
 
 import numpy as np
 import tensorflow as tf
@@ -75,9 +78,12 @@ def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, m
         slot_hiddens = tf.layers.conv1d(tf.concat([slot_reps,context_repeated],2), hidden_size, 1)
 
         click_slot_q_values = tf.layers.conv1d(slot_hiddens, 1, 1) # size batch_size by n_slots
+
+        # TODO: include stack representations in card action eval
+        context_repeated = tf.tile(tf.expand_dims(tf.expand_dims(global_context,1),1), (1, n_slots, max_stack_len, 1))
+        card_hiddens = tf.layers.conv2d(tf.concat([card_reps,context_repeated],3), hidden_size, 1)
         
-        # TODO: the drag and drop values need more context and a hidden layer
-        drag_card_q_values = tf.layers.conv2d(card_reps, 1, 1) # size batch_size by n_slots by max_stack_len
+        drag_card_q_values = tf.layers.conv2d(card_hiddens, 1, 1) # size batch_size by n_slots by max_stack_len
         drop_card_q_values = tf.layers.conv1d(slot_hiddens, 1, 1)
 
         q_values = tf.concat([tf.squeeze(click_slot_q_values,axis=[2]),
@@ -89,7 +95,7 @@ def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, m
 class Model(object):
     def __init__(self, n_slots, max_stack_len):
 
-        gamma = .99
+        gamma = 0.8
         grad_clip_val = 10
 
         self.n_slots = n_slots
@@ -135,13 +141,13 @@ class Model(object):
 
         # error
         error = q_for_actions - (self.reward_ph + (1-self.done_mask_ph)*gamma*best_q_next)
-        total_error = tf.reduce_sum(error * error)
+        self.total_error = tf.reduce_mean(error * error)
 
         # construct optimization op (with gradient clipping)
         self.learning_rate = tf.placeholder(tf.float32, (), name="learning_rate")
         optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate)
 
-        gradients = optimizer.compute_gradients(total_error)
+        gradients = optimizer.compute_gradients(self.total_error)
         for i, (grad, var) in enumerate(gradients):
             if grad is not None:
                 gradients[i] = (tf.clip_by_norm(grad, grad_clip_val), var)
@@ -179,7 +185,8 @@ class Model(object):
         feed_dict.update(obs_feed)
         feed_dict.update(next_obs_feed)
 
-        session.run(self.train_fn, feed_dict=feed_dict)
+        error, _ = session.run([self.total_error,self.train_fn], feed_dict=feed_dict)
+        return error
 
     def feed_dict_from_obs(self, observations, next_values=False):
         n_obs = len(observations)
@@ -245,30 +252,63 @@ class Model(object):
             card_mask[slot,:len(obs[slot])] = 1
         return np.concatenate((np.ones(self.n_slots*2), card_mask.flatten()))
 
+def get_initial_sample(buffer_size, env, model, max_steps_per_ep, initial_samples=500000):
+    sample_file = 'samples.pkl'
+    if path.exists(sample_file):
+        with open(sample_file, 'rb') as f:
+            return pickle.load(f)
+    else:
+        print('gathering samples')
+        buff = Buffer(buffer_size)
+        obs = env.reset()
+        episode_t = 0
+        for t in range(1,initial_samples+1):
+            episode_t += 1
+            action_mask = model.valid_action_mask(obs)
+            action_id = (np.random.random(model.n_actions())*action_mask).argmax()
+            last_obs = obs
+            action = model.action_id_to_action(action_id)
+            obs, rew, done, info = env.step(action)
+
+            buff.insert((last_obs, action_id, obs, rew, done))
+
+            if done or episode_t > max_steps_per_ep:
+                obs = env.reset()
+                episode_t = 0
+
+        with open(sample_file, 'wb') as f:
+            pickle.dump(buff, f)
+        return buff
+             
 def main():
+    debug = False
     update_freq = 4
     batch_size = 32
-    learning_starts = 500000
     max_steps = 5000000
     max_steps_per_ep = 1000
     buffer_size = 1000000
-    init_eps = .95
+    init_eps = .5
     final_eps = .05
     final_eps_timestep = 1000000
     target_update_freq = 10000
+    max_stack_len = 10
 
     env = sol_env.SolEnv()
     obs = env.reset()
-    buff = Buffer(buffer_size)
+    model = Model(len(obs),max_stack_len)
+    buff = get_initial_sample(buffer_size, env, model, max_steps_per_ep)
+
+    saver = tf.train.Saver()
 
     with tf.Session() as sess:
-        model = Model(len(obs),10) # TODO: max stack len?
+        obs = env.reset()
         tf.global_variables_initializer().run()
 
         episode_t = 0
         episode_reward = 0
         num_param_updates = 0
         finished_episode_rewards = []
+        errors = []
         for t in range(1,max_steps+1):
             episode_t += 1
 
@@ -278,12 +318,28 @@ def main():
                 eps = init_eps + (final_eps-init_eps)*t/final_eps_timestep
 
             action_mask = model.valid_action_mask(obs)
-            if t <= learning_starts or random.random() < eps:
+            if random.random() < eps:
                 action_id = (np.random.random(model.n_actions())*action_mask).argmax()
             else:
                 q_values = model.evaluate_q_values(obs, sess)
                 q_values -= (1-action_mask)*1000
-                action_id = q_values.argmax()
+                action_id = (q_values+np.random.randn(*q_values.shape)*.01).argmax()
+                if debug and t % 1000 == 0:
+                    dragging = len(obs[-1][-1])>0
+                    card_qs = q_values[len(obs)*2:].reshape((len(obs),10))
+                    card_mask = action_mask[len(obs)*2:].reshape((len(obs),10))
+                    best_per_stack = card_qs.argmax(axis=1)
+                    lengths = [len(s) for t,s in obs]
+                    ranks_ph = model.tmp_r[0,:,:]
+                    top_ranks = [ranks_ph[i,lengths[i]-1] for i in range(len(lengths)) if lengths[i] > 0]
+                    pos_ph = model.tmp_p[0,:,:]
+                    top_pos = [pos_ph[i,lengths[i]-1] for i in range(len(lengths)) if lengths[i] > 0]
+                    print('============debug info==============')
+                    print(pos_ph)
+                    print(ranks_ph)
+                    print(card_qs)
+                    print(card_mask)
+                
 
             last_obs = obs
             action = model.action_id_to_action(action_id)
@@ -298,17 +354,24 @@ def main():
                 episode_t = 0
                 episode_reward = 0
 
-            if t >= learning_starts and t % update_freq == 0:
-                model.train_step(buff.sample(batch_size), sess)
+            if t % update_freq == 0:
+                error = model.train_step(buff.sample(batch_size), sess)
+                errors.append(error)
                 num_param_updates += 1
 
             if num_param_updates % target_update_freq == 0:
                 model.update_target(sess)
 
-            if t % 10000 == 0:
+            if t % 1000 == 0:
                 print('iteration:', t)
+                print('num updates:', num_param_updates)
                 print('epsilon greedy:', eps)
                 mean_rew = np.mean(finished_episode_rewards[-10:])
                 print('mean reward:', mean_rew)
+                print('error:',np.mean(errors[-100:]))
+
+                if not path.exists('models'):
+                    os.mkdir('models')
+                saver.save(sess, 'models/model', global_step=t)
 
 main()

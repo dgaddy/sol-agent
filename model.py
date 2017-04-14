@@ -73,24 +73,31 @@ def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, m
 
         global_context = c # size batch_size by lstm_size
 
+        context_hidden = tf.layers.dense(global_context, hidden_size, activation=tf.nn.relu)
+        value_func = tf.layers.dense(context_hidden, 1) # deuling network style value and advantage separation
+
+        # advantages
+
         context_repeated = tf.tile(tf.expand_dims(global_context, 1), (1, n_slots, 1))
 
-        slot_hiddens = tf.layers.conv1d(tf.concat([slot_reps,context_repeated],2), hidden_size, 1)
+        slot_hiddens = tf.layers.conv1d(tf.concat([slot_reps,context_repeated],2), hidden_size, 1, activation=tf.nn.relu)
 
-        click_slot_q_values = tf.layers.conv1d(slot_hiddens, 1, 1) # size batch_size by n_slots
+        click_slot_adv_values = tf.layers.conv1d(slot_hiddens, 1, 1) # size batch_size by n_slots
 
         context_repeated = tf.tile(tf.expand_dims(tf.expand_dims(global_context,1),1), (1, n_slots, max_stack_len, 1))
         slot_reps_repeated = tf.tile(tf.expand_dims(slot_reps,2), (1,1,max_stack_len,1))
-        card_hiddens = tf.layers.conv2d(tf.concat([card_reps,context_repeated,slot_reps_repeated],3), hidden_size, 1)
+        card_hiddens = tf.layers.conv2d(tf.concat([card_reps,context_repeated,slot_reps_repeated],3), hidden_size, 1, activation=tf.nn.relu)
         
-        drag_card_q_values = tf.layers.conv2d(card_hiddens, 1, 1) # size batch_size by n_slots by max_stack_len
-        drop_card_q_values = tf.layers.conv1d(slot_hiddens, 1, 1)
+        drag_card_adv_values = tf.layers.conv2d(card_hiddens, 1, 1) # size batch_size by n_slots by max_stack_len
+        drop_card_adv_values = tf.layers.conv1d(slot_hiddens, 1, 1)
 
-        q_values = tf.concat([tf.squeeze(click_slot_q_values,axis=[2]),
-                   tf.squeeze(drop_card_q_values,axis=[2]),
-                   tf.reshape(drag_card_q_values, (-1,n_slots*max_stack_len))],1)
+        adv_values = tf.concat([tf.squeeze(click_slot_adv_values,axis=[2]),
+                   tf.squeeze(drop_card_adv_values,axis=[2]),
+                   tf.reshape(drag_card_adv_values, (-1,n_slots*max_stack_len))],1)
 
-    return q_values
+        adv_values = adv_values - tf.tile(tf.expand_dims(tf.reduce_mean(adv_values,1), 1), (1, n_slots*(2+max_stack_len)))
+
+    return value_func + adv_values
 
 class Model(object):
     def __init__(self, n_slots, max_stack_len):

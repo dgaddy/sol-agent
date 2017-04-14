@@ -240,8 +240,10 @@ class Model(object):
                 extra = len(cards)-max_stack_len
             else:
                 extra = 0
+
+            card = a%max_stack_len+extra
             
-            return sol_env.ActionType.DRAG, slot, a%max_stack_len+extra
+            return sol_env.ActionType.DRAG, slot, len(cards)-card-1
         else:
             assert False # out of range
 

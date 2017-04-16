@@ -29,8 +29,8 @@ class Buffer(object):
 
 def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, max_stack_len, scope, reuse=False):
     emb_size = 32
-    lstm_size = 32
-    hidden_size = 64
+    lstm_size = 128
+    hidden_size = 128
     n_types = 8 # number of slot types
 
     with tf.variable_scope(scope, reuse=reuse):

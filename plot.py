@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 log_files = ['log.txt']
 
 it_pattern = re.compile('iteration: (\\d+)\n')
-val_pattern = re.compile('mean reward: (nan|[\\-0-9\\.]+)\n')
+val_pattern = re.compile('mean reward: (nan|[e\\-0-9\\.]+)\n')
 
 for log_file in log_files:
     iterations = []

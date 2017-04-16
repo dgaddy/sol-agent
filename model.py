@@ -3,6 +3,7 @@ import random
 import pickle
 import os
 import os.path as path
+from collections import defaultdict
 
 import numpy as np
 import tensorflow as tf
@@ -25,6 +26,46 @@ class Buffer(object):
 
     def sample(self, k):
         return random.sample(self.items, k)
+
+class DebugHelper(object):
+    def __init__(self, n_slots, max_stack_len):
+        self.items = []
+        self.index = 0
+        self.n_slots = n_slots
+        self.max_stack_len = max_stack_len
+
+    def insert(self, observation, q_values, action, reward):
+        size = 100
+        item = (observation, q_values, action, reward)
+        if len(self.items) < size:
+            self.items.append(item)
+        else:
+            self.items[self.index] = item
+            self.index = (self.index + 1) % size
+        
+    def print_analysis(self):
+        n_drags_when_dragging = 0
+        n_drops_not_dragging = 0
+
+        counts = defaultdict(int)
+        for obs, q_values, action, reward in self.items:
+            action_type, slot, card = action
+            valid = reward >= 0
+            dragging = len(obs[-1][-1])>0
+
+            if action_type == sol_env.ActionType.DRAG and dragging:
+                n_drags_when_dragging += 1
+            if action_type == sol_env.ActionType.DROP and not dragging:
+                n_drops_not_dragging += 1
+
+            counts[(action_type, valid)] += 1
+
+        print('===========debug info===========')
+        for at in sol_env.ActionType:
+            print('valid', at, counts[(at,True)])
+            print('invalid', at, counts[(at,False)])
+        print('drops when not dragging', n_drops_not_dragging)
+        print('drags when already dragging', n_drags_when_dragging)
 
 
 def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, max_stack_len, scope, reuse=False):
@@ -313,6 +354,8 @@ def main():
     model = Model(len(obs),max_stack_len)
     buff = get_initial_sample(buffer_size, env, model, max_steps_per_ep)
 
+    debug_helper = DebugHelper(len(obs), max_stack_len)
+
     saver = tf.train.Saver()
 
     with tf.Session() as sess:
@@ -335,21 +378,12 @@ def main():
             action_mask = model.valid_action_mask(obs)
             if random.random() < eps:
                 action_id = (np.random.random(model.n_actions())*action_mask).argmax()
+                random_action = True
             else:
                 q_values = model.evaluate_q_values(obs, sess)
                 q_values -= (1-action_mask)*1000
                 action_id = (q_values+np.random.randn(*q_values.shape)*.01).argmax()
-                if debug and t % 1000 == 0:
-                    dragging = len(obs[-1][-1])>0
-                    card_qs = q_values[len(obs)*2:].reshape((len(obs),10))
-                    card_mask = action_mask[len(obs)*2:].reshape((len(obs),10))
-                    best_per_stack = card_qs.argmax(axis=1)
-                    lengths = [len(s) for t,s in obs]
-                    print('============debug info==============')
-                    print(card_qs)
-                    print(card_mask)
-                    print(best_per_stack)
-                    print(lengths)
+                random_action = False
                 
 
             last_obs = obs
@@ -358,6 +392,8 @@ def main():
             episode_reward += rew
 
             buff.insert((last_obs, action_id, obs, rew, done))
+            if not random_action:
+                debug_helper.insert(last_obs, q_values, action, rew)
 
             if done or episode_t > max_steps_per_ep:
                 obs = env.reset()
@@ -374,12 +410,16 @@ def main():
                 model.update_target(sess)
 
             if t % 1000 == 0:
+                print('============================================')
                 print('iteration:', t)
                 print('num updates:', num_param_updates)
                 print('epsilon greedy:', eps)
                 mean_rew = np.mean(finished_episode_rewards[-10:])
                 print('mean reward:', mean_rew)
                 print('error:',np.mean(errors[-100:]))
+
+                if debug:
+                    debug_helper.print_analysis()
 
                 if not path.exists('models'):
                     os.mkdir('models')

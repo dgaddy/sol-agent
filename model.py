@@ -44,19 +44,11 @@ class DebugHelper(object):
             self.index = (self.index + 1) % size
         
     def print_analysis(self):
-        n_drags_when_dragging = 0
-        n_drops_not_dragging = 0
-
         counts = defaultdict(int)
         for obs, q_values, action, reward in self.items:
-            action_type, slot, card = action
+            action_type = action[0]
             valid = reward >= 0
             dragging = len(obs[-1][-1])>0
-
-            if action_type == sol_env.ActionType.DRAG and dragging:
-                n_drags_when_dragging += 1
-            if action_type == sol_env.ActionType.DROP and not dragging:
-                n_drops_not_dragging += 1
 
             counts[(action_type, valid)] += 1
 
@@ -64,8 +56,6 @@ class DebugHelper(object):
         for at in sol_env.ActionType:
             print('valid', at, counts[(at,True)])
             print('invalid', at, counts[(at,False)])
-        print('drops when not dragging', n_drops_not_dragging)
-        print('drags when already dragging', n_drags_when_dragging)
 
 
 def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, max_stack_len, scope, reuse=False):
@@ -86,6 +76,7 @@ def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, m
         rank_emb_matrix = tf.get_variable('rank_emb', [16, emb_size], tf.float32, tf.random_normal_initializer())
         rank_emb = tf.nn.embedding_lookup(rank_emb_matrix, rank_ph)
         
+        # XXX is this necessary anymore?
         position_emb_matrix = tf.get_variable('pos_emb', [max_stack_len+1, emb_size], tf.float32, tf.random_normal_initializer())
         pos_emb = tf.nn.embedding_lookup(position_emb_matrix, pos_ph)
 
@@ -125,18 +116,17 @@ def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, m
 
         click_slot_adv_values = tf.layers.conv1d(slot_hiddens, 1, 1) # size batch_size by n_slots
 
-        context_repeated = tf.tile(tf.expand_dims(tf.expand_dims(global_context,1),1), (1, n_slots, max_stack_len, 1))
-        slot_reps_repeated = tf.tile(tf.expand_dims(slot_reps,2), (1,1,max_stack_len,1))
-        card_hiddens = tf.layers.conv2d(tf.concat([card_reps,context_repeated,slot_reps_repeated],3), hidden_size, 1, activation=tf.nn.relu)
-        
-        drag_card_adv_values = tf.layers.conv2d(card_hiddens, 1, 1) # size batch_size by n_slots by max_stack_len
-        drop_card_adv_values = tf.layers.conv1d(slot_hiddens, 1, 1)
+        from_slot_reps = tf.tile(tf.expand_dims(slot_reps, 2), (1, 1, n_slots, 1))
+        to_slot_reps = tf.tile(tf.expand_dims(slot_reps, 1), (1, n_slots, 1, 1))
+
+        drag_drop_hiddens = tf.layers.conv2d(tf.concat([from_slot_reps, to_slot_reps],3), hidden_size, 1, activation=tf.nn.relu)
+
+        drag_drop_adv_values = tf.layers.conv2d(drag_drop_hiddens, max_stack_len, 1)
 
         adv_values = tf.concat([tf.squeeze(click_slot_adv_values,axis=[2]),
-                   tf.squeeze(drop_card_adv_values,axis=[2]),
-                   tf.reshape(drag_card_adv_values, (-1,n_slots*max_stack_len))],1)
+                   tf.reshape(drag_drop_adv_values, (-1,n_slots*n_slots*max_stack_len))],1)
 
-        adv_values = adv_values - tf.tile(tf.expand_dims(tf.reduce_mean(adv_values,1), 1), (1, n_slots*(2+max_stack_len)))
+        adv_values = adv_values - tf.tile(tf.expand_dims(tf.reduce_mean(adv_values,1), 1), (1, n_slots+n_slots*n_slots*max_stack_len))
 
     return value_func + adv_values
 
@@ -277,36 +267,32 @@ class Model(object):
         n_slots = self.n_slots
         max_stack_len = self.max_stack_len
         if action_id < n_slots:
-            return sol_env.ActionType.CLICK, action_id, 0
-        elif action_id < 2*n_slots:
-            return sol_env.ActionType.DROP, action_id-n_slots, 0
-        elif action_id < n_slots*(2+max_stack_len):
-            a = (action_id-2*n_slots)
-            slot = a//max_stack_len
-            cards = obs[slot][1]
-            if len(cards) > max_stack_len:
-                extra = len(cards)-max_stack_len
-            else:
-                extra = 0
+            return sol_env.ActionType.CLICK, action_id
+        elif action_id < n_slots+n_slots*n_slots*max_stack_len:
+            a = (action_id-n_slots)
 
-            card = a%max_stack_len+extra
+            card = a % max_stack_len
+            a = a // max_stack_len
+            to_slot = a % n_slots
+            a = a // n_slots
+            from_slot = a
             
-            return sol_env.ActionType.DRAG, slot, len(cards)-card-1
+            return sol_env.ActionType.DRAG_DROP, from_slot, card, to_slot
         else:
             assert False # out of range
 
     def n_actions(self):
-        return self.n_slots*(2+self.max_stack_len)
+        return self.n_slots+self.n_slots*self.n_slots*self.max_stack_len
 
     def update_target(self, session):
         session.run(self.update_target_fn)
 
     def valid_action_mask(self, obs):
-        # avoid trying to drag where there is no card; doesn't mean the move is actually valid
-        card_mask = np.zeros((self.n_slots,self.max_stack_len))
+        # only allow drags for up to the number of cards in the pile
+        card_mask = np.zeros((self.n_slots, self.n_slots, self.max_stack_len))
         for slot in range(self.n_slots):
-            card_mask[slot,:len(obs[slot][1])] = 1
-        return np.concatenate((np.ones(self.n_slots*2), card_mask.flatten()))
+            card_mask[slot, :, :len(obs[slot][1])] = 1
+        return np.concatenate((np.ones(self.n_slots), card_mask.flatten()))
 
 def get_initial_sample(buffer_size, env, model, max_steps_per_ep, initial_samples=500000):
     sample_file = 'samples.pkl'

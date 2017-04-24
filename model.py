@@ -42,24 +42,25 @@ class Buffer(object):
     def sample(self, k):
         # return random.sample(self.items, k)
         res = random.sample(self.items, k)
-        while np.mean([0. if x[3] < 0 else 1. for x in res]) < 0.2:
+        while np.mean([0. if x[3] < 0 else 1. for x in res]) < 0.5:
             for i in reversed(range(k)):
                 obs, act, next_obs, rew, done = res[i]
                 if rew < 0:
                     del res[i]
             res.extend(random.sample(self.items, k - len(res)))
 
-
-        try:
-            self.stats
-        except AttributeError:
-            self.stats = []
-
-        self.stats.append([0. if x[3] < 0 else 1. for x in res])
-        if len(self.stats) >= 100:
-            print('Percent of valid actions sampled:', np.mean(self.stats))
-            self.stats.clear()
         return res
+
+        # try:
+        #     self.stats
+        # except AttributeError:
+        #     self.stats = []
+        #
+        # self.stats.append([0. if x[3] < 0 else 1. for x in res])
+        # if len(self.stats) >= 100:
+        #     print('Percent of valid actions sampled:', np.mean(self.stats))
+        #     self.stats.clear()
+        # return res
 
 
 class DebugHelper(object):
@@ -90,29 +91,53 @@ class DebugHelper(object):
             self.random_items[self.random_index] = item
             self.random_index = (self.random_index + 1) % size
 
+    def cards_to_strings(self, cards):
+        return ["?" if fd else "{}{}".format(rank, "♣♦♥♠"[suit]) for (fd, suit, rank) in cards]
+
     def print_analysis(self):
         counts = defaultdict(int)
+        n_useless_drags = 0
         for obs, q_values, action, reward in self.items:
             action_type = action[0]
             valid = reward >= 0
             dragging = len(obs[-1][-1])>0
 
             counts[(action_type, valid)] += 1
+            if action_type == sol_env.ActionType.DRAG_DROP and valid and action[1] in [2,3,4,5]:
+                n_useless_drags += 1
 
-        counts_random = defaultdict(int)
-        for obs, action, reward in self.random_items:
-            action_type = action[0]
-            valid = reward >= 0
+        if self.random_items:
+            counts_random = defaultdict(int)
+            for obs, action, reward in self.random_items:
+                action_type = action[0]
+                valid = reward >= 0
 
-            counts_random[(action_type, valid)] += 1
+                counts_random[(action_type, valid)] += 1
 
 
         print('===========debug info===========')
         for at in sol_env.ActionType:
             print('invalid', at, counts[(at,False)], '/', counts[(at,True)] + counts[(at,False)])
-        for at in sol_env.ActionType:
-            print('random invalid', at, counts_random[(at,False)], '/', counts_random[(at,True)] + counts_random[(at,False)])
+        print('useless drags', n_useless_drags, '/', counts[(sol_env.ActionType.DRAG_DROP, True)])
 
+        if self.random_items:
+            for at in sol_env.ActionType:
+                print('random invalid', at, counts_random[(at,False)], '/', counts_random[(at,True)] + counts_random[(at,False)])
+
+        if True:
+            for obs, q_values, action, reward in self.items:
+                if (reward >= 0) or action[0] != sol_env.ActionType.DRAG_DROP:
+                    continue
+                _, from_slot, card_id, dst_slot = action
+                from_cards = self.cards_to_strings(obs[from_slot][1])
+                dst_cards = self.cards_to_strings(obs[dst_slot][1])
+
+                from_type = obs[from_slot][0].name.lower()
+                dst_type = obs[dst_slot][0].name.lower()
+
+                from_str = '{} [{}]'.format(' '.join(from_cards[-10:-card_id - 1]), ' '.join(from_cards[-card_id - 1:]))
+                dst_str = ' '.join(dst_cards[-10:])
+                print("illegal {} {}: {} -> {} {}: {}".format(from_slot, from_type, from_str, dst_slot, dst_type, dst_str))
 
 
 def batch_gather(params, indices, validate_indices=None,
@@ -158,10 +183,10 @@ def batch_gather(params, indices, validate_indices=None,
 
 
 def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, max_stack_len, scope, reuse=False):
-    emb_size = 32
+    emb_size = 64
     lstm_size = 128
     hidden_size = 128
-    n_types = 8 # number of slot types
+    n_types = 8 # number of slot types.
 
     with tf.variable_scope(scope, reuse=reuse):
 
@@ -175,52 +200,40 @@ def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, m
         rank_emb_matrix = tf.get_variable('rank_emb', [16, emb_size], tf.float32, tf.random_normal_initializer())
         rank_emb = tf.nn.embedding_lookup(rank_emb_matrix, rank_ph)
 
-        # XXX is this necessary anymore?
-        position_emb_matrix = tf.get_variable('pos_emb', [max_stack_len+1, emb_size], tf.float32, tf.random_normal_initializer())
-        pos_emb = tf.nn.embedding_lookup(position_emb_matrix, pos_ph)
+        card_reps = tf.concat([vis_emb, suit_emb, rank_emb],3)
 
-        card_reps = tf.concat([vis_emb, suit_emb, rank_emb, pos_emb],3)
-        # %break
+        # run rnn over cards in each slot
+        card_reps_reshaped = tf.reshape(card_reps, [-1, max_stack_len, emb_size*3])
+        seq_len = tf.reshape(seq_len_ph, [-1])
 
-        # n_slots
-        # max_stack_len
+        cell_fw = tf.contrib.rnn.LSTMCell(lstm_size, use_peepholes=True)
+        cell_bw = tf.contrib.rnn.LSTMCell(lstm_size, use_peepholes=True)
 
-        if True:
-            # TODO(nikita): use this to generate card representations
-            # run rnn over cards in each slot
-            card_reps_reshaped = tf.reshape(card_reps, [-1, max_stack_len, emb_size*4])
-            seq_len = tf.reshape(seq_len_ph, [-1])
+        (o1, o2), ((c1, h1), (c2, h2)) = tf.nn.bidirectional_dynamic_rnn(cell_fw, cell_bw, card_reps_reshaped, seq_len, dtype=tf.float32, scope='card_lstm')
 
-            outputs, (c,h) = tf.nn.dynamic_rnn(tf.contrib.rnn.LSTMCell(lstm_size, reuse=reuse), card_reps_reshaped, seq_len, dtype=tf.float32, scope='card_lstm')
-            # state is batch_size*n_slots by lstm_size
+        # reverse since the "from" action is parametrized such that the last
+        # card in a slot is 0, while our observation has the first card at index 0.
+        contextual_card_reps_reversed = tf.reshape(tf.reverse_sequence(tf.concat([o1, o2], -1),
+            seq_len, seq_axis=1, batch_axis=0),
+            [-1, n_slots, max_stack_len, lstm_size * 2])
 
-            card_slot_rep = tf.reshape(c, [-1, n_slots, lstm_size])
-
-        # Actual slot representations: no LSTM for now
-        empty_slot_emb = tf.get_variable('empty_slot_emb', shape=[1, 1, lstm_size], initializer=tf.random_normal_initializer())
-
-        top_card_idx = tf.nn.relu(seq_len_ph - 1)
-        top_card_reps = batch_gather(
-            tf.reshape(card_reps, [-1, int(card_reps.get_shape()[2]), int(card_reps.get_shape()[3])]),
-            tf.reshape(top_card_idx, [-1]))
-        top_card_reps = tf.reshape(top_card_reps, [-1, n_slots, int(card_reps.get_shape()[-1])])
-
-        card_slot_rep = tf.where(tf.expand_dims(seq_len_ph > 0, -1) & tf.ones(tf.shape(top_card_reps), dtype=tf.bool),
-            top_card_reps, empty_slot_emb * tf.ones_like(top_card_reps))
+        card_slot_rep = tf.reshape(tf.concat([c1, c2], -1), [-1, n_slots, lstm_size*2])
 
         # concat in slot properties
-
         type_emb_matrix = tf.get_variable('type_emb', [n_types, emb_size], tf.float32, tf.random_normal_initializer())
         type_emb = tf.nn.embedding_lookup(type_emb_matrix, type_ph)
 
         slot_reps = tf.concat([card_slot_rep, type_emb], 2)
-        # slot_reps is batch_size by n_slots by emb_size+lstm_size
+        contextual_card_reps_reversed = tf.concat([contextual_card_reps_reversed, tf.tile(tf.expand_dims(type_emb, 2), (1,1,max_stack_len,1))], -1)
 
         # run rnn over all the slots
+        # note: apparently the sequence length argument is required
+        (o1, o2), ((c1,h1), (c2, h2)) = tf.nn.bidirectional_dynamic_rnn(
+            tf.contrib.rnn.LSTMCell(lstm_size), tf.contrib.rnn.LSTMCell(lstm_size),
+            slot_reps, tf.tile([n_slots], (tf.shape(slot_reps)[0],)), dtype=tf.float32, scope='slot_lstm')
 
-        outputs, (c,h) = tf.nn.dynamic_rnn(tf.contrib.rnn.LSTMCell(lstm_size, reuse=reuse), slot_reps, dtype=tf.float32, scope='slot_lstm')
-
-        global_context = c # size batch_size by lstm_size
+        global_context = tf.concat([c1, c2], -1) # size batch_size by lstm_size
+        contextual_slot_reps = tf.concat([o1, o2], -1)
 
         context_hidden = tf.layers.dense(global_context, hidden_size, activation=tf.nn.relu)
         value_func = tf.layers.dense(context_hidden, 1) # deuling network style value and advantage separation
@@ -229,44 +242,29 @@ def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, m
 
         context_repeated = tf.tile(tf.expand_dims(global_context, 1), (1, n_slots, 1))
 
+        # TODO(nikita): this should really use the contextual embeddings from the LSTM,
+        # not just the original inputs and the lstm output
         slot_hiddens = tf.layers.conv1d(tf.concat([slot_reps,context_repeated],2), hidden_size, 1, activation=tf.nn.relu)
 
         click_slot_adv_values = tf.layers.conv1d(slot_hiddens, 1, 1) # size batch_size by n_slots
 
         # better-parametrized drag-and-drop
-        to_slot_reps = tf.expand_dims(tf.expand_dims(slot_reps, 1), 3) # (?, 1, n_slots, 1, ...)
-
-        # the "from" action is parametrized such that the last card in a slot is 0,
-        # while our observation has the first card at index 0.
-        card_reps_reversed = tf.reshape(
-            tf.reverse_sequence(card_reps_reshaped, seq_len, seq_axis=1, batch_axis=0),
-            tf.shape(card_reps))
-        from_reps = tf.expand_dims(card_reps_reversed, 2)
+        to_slot_reps = tf.expand_dims(tf.expand_dims(contextual_slot_reps, 1), 3) # (?, 1, n_slots, 1, ...)
+        from_reps = tf.expand_dims(contextual_card_reps_reversed, 2)
 
         drag_drop_reps = tf.concat([
             tf.tile(from_reps, (1, 1, n_slots, 1, 1)),
-            tf.tile(to_slot_reps, (1, n_slots, 1, max_stack_len, 1)),
-            # tf.tile(tf.reshape(global_context, [-1, 1, 1, 1, lstm_size]), (1, n_slots, n_slots, max_stack_len, 1))
-            ], -1)
-
-        # from_slot_reps = tf.tile(tf.expand_dims(slot_reps, 2), (1, 1, n_slots, 1))
-        # to_slot_reps = tf.tile(tf.expand_dims(slot_reps, 1), (1, n_slots, 1, 1))
-
-        # drag_drop_hiddens = tf.layers.conv2d(tf.concat([from_slot_reps, to_slot_reps],3), hidden_size, 1, activation=tf.nn.relu)
-
-        # drag_drop_adv_values = tf.layers.conv2d(drag_drop_hiddens, max_stack_len, 1)
+            tf.tile(to_slot_reps, (1, n_slots, 1, max_stack_len, 1))], -1)
 
         drag_drop_hiddens = tf.layers.dense(drag_drop_reps, hidden_size, activation=tf.nn.relu)
 
         drag_drop_adv_values = tf.squeeze(tf.layers.dense(drag_drop_hiddens, 1), -1)
         # note: masking out invalid drags is handled outside the computation graph
 
-        # drag_drop_adv_values
-
         adv_values = tf.concat([tf.squeeze(click_slot_adv_values,axis=[2]),
                    tf.reshape(drag_drop_adv_values, (-1,n_slots*n_slots*max_stack_len))],1)
 
-        adv_values = adv_values - tf.tile(tf.expand_dims(tf.reduce_mean(adv_values,1), 1), (1, n_slots+n_slots*n_slots*max_stack_len))
+        adv_values = adv_values - tf.reduce_mean(adv_values, 1, keep_dims=True)
 
     return value_func + adv_values
 
@@ -329,6 +327,7 @@ class Model(object):
         for i, (grad, var) in enumerate(gradients):
             if grad is not None:
                 gradients[i] = (tf.clip_by_norm(grad, grad_clip_val), var)
+                gradients[i] = (tf.verify_tensor_all_finite(gradients[i][0], 'non-finite grad'), var)
         self.train_fn = optimizer.apply_gradients(gradients)
 
         # update_target_fn will be called periodically to copy Q network to target Q network
@@ -381,7 +380,8 @@ class Model(object):
             for slot_num in range(self.n_slots):
                 slot_type, cards = observation[slot_num]
 
-                types[obs_num,slot_num] = slot_type.value
+                # note that Python enums are 1-indexed
+                types[obs_num,slot_num] = slot_type.value - 1
 
                 if len(cards) > self.max_stack_len:
                     cards = cards[-self.max_stack_len:] # take the top cards of the stack if it is too long
@@ -521,8 +521,8 @@ def main():
             buff.insert((last_obs, action_id, obs, rew, done))
             if not random_action:
                 debug_helper.insert(last_obs, q_values, action, rew)
-            else:
-                debug_helper.insert_random(last_obs, action, rew)
+            # else:
+                # debug_helper.insert_random(last_obs, action, rew)
 
             if done or episode_t > max_steps_per_ep:
                 obs = env.reset()

@@ -125,9 +125,14 @@ class DebugHelper(object):
                 print('random invalid', at, counts_random[(at,False)], '/', counts_random[(at,True)] + counts_random[(at,False)])
 
         if True:
+            prev_obs = None
             for obs, q_values, action, reward in self.items:
                 if (reward >= 0) or action[0] != sol_env.ActionType.DRAG_DROP:
                     continue
+                if obs == prev_obs:
+                    continue
+                prev_obs = obs
+
                 _, from_slot, card_id, dst_slot = action
                 from_cards = self.cards_to_strings(obs[from_slot][1])
                 dst_cards = self.cards_to_strings(obs[dst_slot][1])
@@ -135,9 +140,32 @@ class DebugHelper(object):
                 from_type = obs[from_slot][0].name.lower()
                 dst_type = obs[dst_slot][0].name.lower()
 
-                from_str = '{} [{}]'.format(' '.join(from_cards[-10:-card_id - 1]), ' '.join(from_cards[-card_id - 1:]))
-                dst_str = ' '.join(dst_cards[-10:])
-                print("illegal {} {}: {} -> {} {}: {}".format(from_slot, from_type, from_str, dst_slot, dst_type, dst_str))
+                # from_str = '{} [{}]'.format(' '.join(from_cards[-10:-card_id - 1]), ' '.join(from_cards[-card_id - 1:]))
+                # dst_str = ' '.join(dst_cards[-10:])
+                # print("illegal {} {}: {} -> {} {}: {}".format(from_slot, from_type, from_str, dst_slot, dst_type, dst_str))
+                # for i, (slot_type, cards) in enumerate(obs):
+                #     print("  {} {}: {}".format(
+                #         i, slot_type.name.lower(), ' '.join(self.cards_to_strings(cards[-10:]))))
+
+            prev_obs = None
+            for obs, q_values, action, reward in self.items:
+                if action[0] != sol_env.ActionType.CLICK:
+                    continue
+
+                if obs == prev_obs:
+                    continue
+                prev_obs = obs
+
+                slot_type = obs[action[1]][0].name.lower()
+                cards = self.cards_to_strings(obs[action[1]][1])
+                if (reward >= 0):
+                    print('legal click {} {}: {}'.format(action[1], slot_type, ' '.join(cards[-10:])))
+                else:
+                    print('illegal click {} {}: {}'.format(action[1], slot_type, ' '.join(cards[-10:])))
+                    for i, (slot_type, cards) in enumerate(obs):
+                        print("  {} {}: {}".format(
+                            i, slot_type.name.lower(), ' '.join(self.cards_to_strings(cards[-10:]))))
+
 
 
 def batch_gather(params, indices, validate_indices=None,
@@ -421,6 +449,18 @@ class Model(object):
         else:
             assert False # out of range
 
+    def action_to_action_id(self, action):
+        n_slots = self.n_slots
+        max_stack_len = self.max_stack_len
+        action_type = action[0]
+        if action_type == sol_env.ActionType.CLICK:
+            return action[1]
+        elif action_type == sol_env.ActionType.DRAG_DROP:
+            from_slot, card, to_slot = action[1:]
+            return from_slot * (max_stack_len * n_slots) + to_slot * (max_stack_len) + card + n_slots
+        else:
+            assert False # unsupported
+
     def n_actions(self):
         return self.n_slots+self.n_slots*self.n_slots*self.max_stack_len
 
@@ -469,13 +509,17 @@ def main():
     max_steps = 5000000
     max_steps_per_ep = 10000
     buffer_size = 1000000
-    init_eps = 0.99 # .5
-    final_eps = 0.1 # .05
-    final_eps_timestep = 10000000 # 1000000
+    init_eps = 0.9
+    final_eps = 0.1
+    final_eps_timestep = 100000
     target_update_freq = 10000
     max_stack_len = 10
 
-    env = sol_env.SolEnv('klondike')
+    env = sol_env.SolEnv('toy-klondike')
+    # NOTE(nikita): I'm enabling unlimited redeals because it makes the observations
+    # more Markovian, just to make sure that running out of cards from the deck
+    # isn't what's holding up learning
+    env.change_options({'Unlimited redeals': True})
     obs = env.reset()
     model = Model(len(obs),max_stack_len)
     buff = get_initial_sample(buffer_size, env, model, max_steps_per_ep)
@@ -485,6 +529,7 @@ def main():
     saver = tf.train.Saver()
 
     with tf.Session() as sess:
+        raw_env = env
         env = gym.wrappers.Monitor(env, os.path.join('/tmp/sol_vid', "gym"), force=True)
         obs = env.reset()
         tf.global_variables_initializer().run()
@@ -503,7 +548,19 @@ def main():
                 eps = init_eps + (final_eps-init_eps)*t/final_eps_timestep
 
             action_mask = model.valid_action_mask(obs)
-            if random.random() < eps:
+
+            # XXX(nikita): the probabilities assigned to the different strategies
+            # are probably suboptimal
+            rnd = random.random()
+            if rnd < 0.2:
+                random_action = True
+                possible_actions = raw_env.get_hint_actions()
+                if not possible_actions:
+                    action_id = (np.random.random(model.n_actions())*action_mask).argmax()
+                else:
+                    action = random.choice(possible_actions)
+                    action_id = model.action_to_action_id(action)
+            elif rnd < eps:
                 action_id = (np.random.random(model.n_actions())*action_mask).argmax()
                 random_action = True
             else:

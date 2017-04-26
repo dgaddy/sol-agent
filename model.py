@@ -15,6 +15,7 @@ import pickle
 import os
 import os.path as path
 from collections import defaultdict
+import matplotlib.pyplot as plt
 
 import numpy as np
 import tensorflow as tf
@@ -64,11 +65,12 @@ class Buffer(object):
 
 
 class DebugHelper(object):
-    def __init__(self, n_slots, max_stack_len):
+    def __init__(self, n_slots, max_stack_len, model):
         self.items = []
         self.index = 0
         self.n_slots = n_slots
         self.max_stack_len = max_stack_len
+        self.model = model
 
         self.random_items = []
         self.random_index = 0
@@ -165,6 +167,25 @@ class DebugHelper(object):
                     for i, (slot_type, cards) in enumerate(obs):
                         print("  {} {}: {}".format(
                             i, slot_type.name.lower(), ' '.join(self.cards_to_strings(cards[-10:]))))
+
+        if True:
+            valid_qs = []
+            invalid_qs = []
+            valid_mask = self.model.valid_action_mask(obs)
+            for action_id in range(self.model.n_actions()):
+                if valid_mask[action_id] != 1:
+                    continue
+                action = self.model.action_id_to_action(action_id, obs)
+                valid = klondike_valid(action, obs)
+
+                q = q_values[action_id]
+                if valid:
+                    valid_qs.append(q)
+                else:
+                    invalid_qs.append(q)
+            plt.hist(invalid_qs)
+            plt.hist(valid_qs)
+            plt.show()
 
 
 
@@ -572,7 +593,7 @@ def get_initial_sample(buffer_size, env, model, max_steps_per_ep, initial_sample
             last_obs = obs
             action = model.action_id_to_action(action_id, obs)
             obs, rew, done, info = env.step(action)
-            rew = klondike_reward_detailed(action, last_obs)
+            #rew = klondike_reward_detailed(action, last_obs)
             '''is_valid = klondike_valid(action, last_obs)
             if is_valid != (rew != -0.1):
                 print('%s %s %s %s'%(action, last_obs, is_valid, rew))
@@ -611,7 +632,7 @@ def main():
     model = Model(len(obs),max_stack_len)
     buff = get_initial_sample(buffer_size, env, model, max_steps_per_ep)
 
-    debug_helper = DebugHelper(len(obs), max_stack_len)
+    debug_helper = DebugHelper(len(obs), max_stack_len, model)
 
     saver = tf.train.Saver()
 
@@ -660,7 +681,7 @@ def main():
             last_obs = obs
             action = model.action_id_to_action(action_id, obs)
             obs, rew, done, info = env.step(action)
-            rew = klondike_reward_detailed(action, last_obs)
+            #rew = klondike_reward_detailed(action, last_obs)
             episode_reward += rew
 
             buff.insert((last_obs, action_id, obs, rew, done))

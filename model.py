@@ -665,6 +665,7 @@ def main():
         episode_reward = 0
         num_param_updates = 0
         finished_episode_rewards = []
+        finished_episode_scores = []
         errors = []
         for t in range(1,max_steps+1):
             episode_t += 1
@@ -717,6 +718,7 @@ def main():
             if done or episode_t > max_steps_per_ep:
                 obs = env.reset()
                 finished_episode_rewards.append(episode_reward)
+                finished_episode_scores.append(info['score'])
                 episode_t = 0
                 episode_reward = 0
 
@@ -735,6 +737,8 @@ def main():
                 print('epsilon greedy:', eps)
                 mean_rew = np.mean(finished_episode_rewards[-10:])
                 print('mean reward:', mean_rew)
+                mean_score = np.mean(finished_episode_scores[-10:])
+                print('mean score:', mean_score)
                 print('error:',np.mean(errors[-100:]))
 
                 if debug:

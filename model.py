@@ -474,7 +474,88 @@ class Model(object):
             card_mask[slot, :, :len(obs[slot][1])] = 1
         return np.concatenate((np.ones(self.n_slots), card_mask.flatten()))
 
-def get_initial_sample(buffer_size, env, model, max_steps_per_ep, initial_samples=500000):
+def klondike_valid(action, obs):
+    # assumes the slot and card for action exists
+
+    def diff_color(suit1, suit2):
+        s1b = suit1 in [0,3]
+        s2b = suit2 in [0,3]
+        return (s1b and not s2b) or (not s1b and s2b)
+
+    def stackable(base_card, card_on_top):
+        base_facedown, base_suit, base_rank = base_card
+        top_facedown, top_suit, top_rank = card_on_top
+        return not base_facedown and not top_facedown and diff_color(base_suit, top_suit) and \
+            base_rank == top_rank + 1
+
+    action_type = action[0]
+    if action_type == sol_env.ActionType.DRAG_DROP:
+        _, from_slot, card, to_slot = action
+        from_slot_type = obs[from_slot][0]
+        to_slot_type = obs[to_slot][0]
+        from_slot_cards = obs[from_slot][1]
+        to_slot_cards = obs[to_slot][1]
+        cards_being_dragged = from_slot_cards[-card-1:]
+
+        if to_slot_type == sol_env.SlotType.FOUNDATION:
+            if len(cards_being_dragged) != 1:
+                return False
+
+            drag_facedown, drag_suit, drag_rank = cards_being_dragged[0]
+            if len(to_slot_cards) == 0:
+                return not drag_facedown and drag_rank == 1 # must be an ace
+            else:
+                drop_onto_card = to_slot_cards[-1]
+                drop_facedown, drop_suit, drop_rank = drop_onto_card
+                return not drag_facedown and drag_suit == drop_suit and drag_rank == drop_rank + 1
+        elif to_slot_type == sol_env.SlotType.TABLEAU:
+            for i in range(len(cards_being_dragged)-1):
+                if not stackable(cards_being_dragged[i], cards_being_dragged[i+1]):
+                    return False
+
+            if len(to_slot_cards) == 0:
+                drag_facedown, drag_suit, drag_rank = cards_being_dragged[0]
+                return not drag_facedown and drag_rank == 13
+            else:
+                return stackable(to_slot_cards[-1], cards_being_dragged[0])
+        else:
+            return False
+                
+    elif action_type == sol_env.ActionType.CLICK:
+        _, slot = action
+        if obs[slot][0] == sol_env.SlotType.STOCK:
+            return True
+        else:
+            return False
+
+    return False
+
+def klondike_reward_detailed(action, obs):
+    if not klondike_valid(action, obs):
+        return -1
+    
+    action_type = action[0]
+    if action_type == sol_env.ActionType.DRAG_DROP:
+        _, from_slot, card, to_slot = action
+        from_slot_type = obs[from_slot][0]
+        if from_slot_type == sol_env.SlotType.FOUNDATION:
+            return -1 # rarely a good idea
+        from_slot_cards = obs[from_slot][1]
+        to_slot_type = obs[to_slot][0]
+        to_slot_cards = obs[to_slot][1]
+        if from_slot_type == to_slot_type and card == len(from_slot_cards)-1 and len(to_slot_cards) == 0:
+            return -1 # just moving an entire stack of cards doesn't really do anything
+
+        if to_slot_type == sol_env.SlotType.FOUNDATION:
+            return 2 # moving cards up is extra good
+        return 1 # a valid, useful drag
+    elif action_type == sol_env.ActionType.CLICK:
+        return 0 # don't encourage or discourage this
+
+    assert False
+        
+
+def get_initial_sample(buffer_size, env, model, max_steps_per_ep, initial_samples=50000):
     sample_file = 'samples.pkl'
     if path.exists(sample_file):
         with open(sample_file, 'rb') as f:
@@ -491,6 +572,12 @@ def get_initial_sample(buffer_size, env, model, max_steps_per_ep, initial_sample
             last_obs = obs
             action = model.action_id_to_action(action_id, obs)
             obs, rew, done, info = env.step(action)
+            rew = klondike_reward_detailed(action, last_obs)
+            '''is_valid = klondike_valid(action, last_obs)
+            if is_valid != (rew != -0.1):
+                print('%s %s %s %s'%(action, last_obs, is_valid, rew))
+                while True:
+                    time.sleep(1)'''
 
             buff.insert((last_obs, action_id, obs, rew, done))
 
@@ -507,7 +594,7 @@ def main():
     update_freq = 4
     batch_size = 32
     max_steps = 5000000
-    max_steps_per_ep = 10000
+    max_steps_per_ep = 1000
     buffer_size = 1000000
     init_eps = 0.9
     final_eps = 0.1
@@ -552,7 +639,7 @@ def main():
             # XXX(nikita): the probabilities assigned to the different strategies
             # are probably suboptimal
             rnd = random.random()
-            if rnd < 0.2:
+            if rnd < 0.0:
                 random_action = True
                 possible_actions = raw_env.get_hint_actions()
                 if not possible_actions:
@@ -573,6 +660,7 @@ def main():
             last_obs = obs
             action = model.action_id_to_action(action_id, obs)
             obs, rew, done, info = env.step(action)
+            rew = klondike_reward_detailed(action, last_obs)
             episode_reward += rew
 
             buff.insert((last_obs, action_id, obs, rew, done))

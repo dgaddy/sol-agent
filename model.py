@@ -15,7 +15,7 @@ import pickle
 import os
 import os.path as path
 from collections import defaultdict
-import matplotlib.pyplot as plt
+#import matplotlib.pyplot as plt
 
 import numpy as np
 import tensorflow as tf
@@ -126,7 +126,8 @@ class DebugHelper(object):
             for at in sol_env.ActionType:
                 print('random invalid', at, counts_random[(at,False)], '/', counts_random[(at,True)] + counts_random[(at,False)])
 
-        if True:
+
+        if False:
             prev_obs = None
             for obs, q_values, action, reward in self.items:
                 if (reward >= 0) or action[0] != sol_env.ActionType.DRAG_DROP:
@@ -168,7 +169,7 @@ class DebugHelper(object):
                         print("  {} {}: {}".format(
                             i, slot_type.name.lower(), ' '.join(self.cards_to_strings(cards[-10:]))))
 
-        if True:
+        if False:
             valid_qs = []
             invalid_qs = []
             valid_mask = self.model.valid_action_mask(obs)
@@ -187,6 +188,24 @@ class DebugHelper(object):
             plt.hist(valid_qs)
             plt.show()
 
+        valid_ranks = []
+        click_deck_ranks = []
+        for obs, q_values, _, _ in self.items:
+            numbers = list(range(len(q_values)))
+            valid_mask = self.model.valid_action_mask(obs)
+            numbers = [i for i in numbers if valid_mask[i] == 1] # filter invalid
+            numbers.sort(key=lambda x: q_values[x], reverse=True)
+            found_valid = False
+            for i, action_id in enumerate(numbers):
+                action = self.model.action_id_to_action(action_id, obs)
+                if action[0] == sol_env.ActionType.CLICK and action[1] == 0:
+                    click_deck_ranks.append(i)
+                if not found_valid and klondike_valid(action, obs):
+                    valid_ranks.append(i)
+                    found_valid = True
+        print('average rank of first valid action', np.mean(valid_ranks))
+        print('average rank of click deck action', np.mean(click_deck_ranks))
+            
 
 
 def batch_gather(params, indices, validate_indices=None,
@@ -617,8 +636,8 @@ def main():
     max_steps = 5000000
     max_steps_per_ep = 1000
     buffer_size = 1000000
-    init_eps = 0.9
-    final_eps = 0.1
+    init_eps = 0.05
+    final_eps = 0.05
     final_eps_timestep = 100000
     target_update_freq = 10000
     max_stack_len = 10
@@ -672,9 +691,14 @@ def main():
                 action_id = (np.random.random(model.n_actions())*action_mask).argmax()
                 random_action = True
             else:
+                # choose randomly from top k q values
+                k = 10 if random.random() < .5 else 100
                 q_values = model.evaluate_q_values(obs, sess)
-                q_values -= (1-action_mask)*1000
-                action_id = (q_values+np.random.randn(*q_values.shape)*.01).argmax()
+                numbers = list(range(len(q_values)))
+                numbers = [i for i in numbers if action_mask[i] == 1] # filter invalid
+                numbers.sort(key=lambda x: q_values[x], reverse=True)
+                action_id = np.random.choice(numbers[:k])
+
                 random_action = False
 
 

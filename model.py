@@ -74,7 +74,7 @@ class DebugHelper(object):
         self.random_index = 0
 
     def insert(self, observation, q_values, action, reward):
-        size = 100
+        size = 1000
         item = (observation, q_values, action, reward)
         if len(self.items) < size:
             self.items.append(item)
@@ -83,7 +83,7 @@ class DebugHelper(object):
             self.index = (self.index + 1) % size
 
     def insert_random(self, observation, action, reward):
-        size = 100
+        size = 1000
         item = (observation, action, reward)
         if len(self.random_items) < size:
             self.random_items.append(item)
@@ -99,7 +99,7 @@ class DebugHelper(object):
         n_useless_drags = 0
         for obs, q_values, action, reward in self.items:
             action_type = action[0]
-            valid = reward >= 0
+            valid = reward >= 0 or reward < -0.99 # -1 reward for dragging down from foundations
             dragging = len(obs[-1][-1])>0
 
             counts[(action_type, valid)] += 1
@@ -124,7 +124,7 @@ class DebugHelper(object):
             for at in sol_env.ActionType:
                 print('random invalid', at, counts_random[(at,False)], '/', counts_random[(at,True)] + counts_random[(at,False)])
 
-        if True:
+        if False:
             prev_obs = None
             for obs, q_values, action, reward in self.items:
                 if (reward >= 0) or action[0] != sol_env.ActionType.DRAG_DROP:
@@ -210,7 +210,7 @@ def batch_gather(params, indices, validate_indices=None,
     return tf.gather(flat_params, indices_into_flat, validate_indices=validate_indices)
 
 
-def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, max_stack_len, scope, reuse=False):
+def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, valid_ph, n_slots, max_stack_len, scope, reuse=False):
     emb_size = 64
     lstm_size = 128
     hidden_size = 128
@@ -287,12 +287,13 @@ def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, n_slots, m
         drag_drop_hiddens = tf.layers.dense(drag_drop_reps, hidden_size, activation=tf.nn.relu)
 
         drag_drop_adv_values = tf.squeeze(tf.layers.dense(drag_drop_hiddens, 1), -1)
-        # note: masking out invalid drags is handled outside the computation graph
 
         adv_values = tf.concat([tf.squeeze(click_slot_adv_values,axis=[2]),
                    tf.reshape(drag_drop_adv_values, (-1,n_slots*n_slots*max_stack_len))],1)
 
         adv_values = adv_values - tf.reduce_mean(adv_values, 1, keep_dims=True)
+
+        adv_values = tf.where(valid_ph, adv_values, -1e8 * tf.ones_like(adv_values))
 
     return value_func + adv_values
 
@@ -312,6 +313,7 @@ class Model(object):
         self.pos_ph = tf.placeholder(tf.int32, [None,n_slots,max_stack_len])
         self.seq_len_ph = tf.placeholder(tf.int32, [None,n_slots])
         self.type_ph = tf.placeholder(tf.int32, [None,n_slots])
+        self.valid_ph = tf.placeholder(tf.bool, [None, self.n_actions()])
 
         # placeholders for next timestep
         self.next_visible_ph = tf.placeholder(tf.int32, [None,n_slots,max_stack_len]) # values are pad,y,n
@@ -320,6 +322,7 @@ class Model(object):
         self.next_pos_ph = tf.placeholder(tf.int32, [None,n_slots,max_stack_len])
         self.next_seq_len_ph = tf.placeholder(tf.int32, [None,n_slots])
         self.next_type_ph = tf.placeholder(tf.int32, [None,n_slots])
+        self.next_valid_ph = tf.placeholder(tf.bool, [None, self.n_actions()])
 
         # other placeholders
         self.action_ph = tf.placeholder(tf.int32, [None])
@@ -327,12 +330,12 @@ class Model(object):
         self.done_mask_ph = tf.placeholder(tf.float32, [None])
 
         # compute q values
-        self.q_values = q_func(self.visible_ph, self.suit_ph, self.rank_ph, self.pos_ph, self.seq_len_ph, self.type_ph, n_slots, max_stack_len, 'q_func', False)
+        self.q_values = q_func(self.visible_ph, self.suit_ph, self.rank_ph, self.pos_ph, self.seq_len_ph, self.type_ph, self.valid_ph, n_slots, max_stack_len, 'q_func', False)
         q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='q_func')
 
         # compute q and target q network values for next timestep
-        next_q_values = q_func(self.next_visible_ph, self.next_suit_ph, self.next_rank_ph, self.next_pos_ph, self.next_seq_len_ph, self.next_type_ph, n_slots, max_stack_len, 'q_func', reuse=True)
-        target_next_q_values = q_func(self.next_visible_ph, self.next_suit_ph, self.next_rank_ph, self.next_pos_ph, self.next_seq_len_ph, self.next_type_ph, n_slots, max_stack_len, 'target_q_func', reuse=False)
+        next_q_values = q_func(self.next_visible_ph, self.next_suit_ph, self.next_rank_ph, self.next_pos_ph, self.next_seq_len_ph, self.next_type_ph, self.next_valid_ph, n_slots, max_stack_len, 'q_func', reuse=True)
+        target_next_q_values = q_func(self.next_visible_ph, self.next_suit_ph, self.next_rank_ph, self.next_pos_ph, self.next_seq_len_ph, self.next_type_ph, self.next_valid_ph, n_slots, max_stack_len, 'target_q_func', reuse=False)
         target_q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='target_q_func')
 
         # select the q values for the selected actions
@@ -401,10 +404,13 @@ class Model(object):
         rank = np.zeros((n_obs,self.n_slots,self.max_stack_len), dtype=np.int32)
         suit = np.zeros((n_obs,self.n_slots,self.max_stack_len), dtype=np.int32)
         pos = np.zeros((n_obs,self.n_slots,self.max_stack_len), dtype=np.int32)
+        valid = np.zeros((n_obs, self.n_actions()), dtype=bool)
 
         for obs_num in range(n_obs):
             observation = observations[obs_num]
             assert len(observation) == self.n_slots
+
+            valid[obs_num, :] = (self.valid_action_mask(observation) > 0)
             for slot_num in range(self.n_slots):
                 slot_type, cards = observation[slot_num]
 
@@ -427,9 +433,9 @@ class Model(object):
                     suit[obs_num,slot_num,card_num] = s
 
         if next_values:
-            return {self.next_visible_ph:visible,self.next_suit_ph:suit, self.next_rank_ph:rank, self.next_pos_ph:pos, self.next_seq_len_ph:lengths, self.next_type_ph:types}
+            return {self.next_visible_ph:visible,self.next_suit_ph:suit, self.next_rank_ph:rank, self.next_pos_ph:pos, self.next_seq_len_ph:lengths, self.next_type_ph:types, self.next_valid_ph:valid}
         else:
-            return {self.visible_ph:visible,self.suit_ph:suit, self.rank_ph:rank, self.pos_ph:pos, self.seq_len_ph:lengths, self.type_ph:types}
+            return {self.visible_ph:visible,self.suit_ph:suit, self.rank_ph:rank, self.pos_ph:pos, self.seq_len_ph:lengths, self.type_ph:types, self.valid_ph:valid}
 
     def action_id_to_action(self, action_id, obs):
         n_slots = self.n_slots
@@ -502,6 +508,90 @@ def get_initial_sample(buffer_size, env, model, max_steps_per_ep, initial_sample
             pickle.dump(buff, f)
         return buff
 
+class Counter:
+    def __init__(self, n_actions):
+        self.table = {}
+        self.n_actions = n_actions
+
+    def hash_obs(self, obs):
+        return hash(tuple([(a, tuple(b)) for a,b in obs]))
+
+    def visit(self, obs):
+        """
+        obs -> (bonus, is_uniform, obs_token)
+        """
+        h = self.hash_obs(obs)
+        if h not in self.table:
+            self.table[h] = np.ones(self.n_actions, dtype=int)
+            uniform = True
+        else:
+            uniform = False
+
+        entry = self.table[h]
+        res = np.sqrt(np.log(np.sum(entry)) / entry) # UCB
+        return res, uniform, h
+
+    def record_action(self, obs_token, action_id):
+        assert obs_token in self.table
+        self.table[obs_token][action_id] += 1
+
+    def reset(self):
+        self.table = {}
+
+class HashCounter:
+    def __init__(self, n_actions, max_stack_len):
+        self.num_cards = 64 # TODO: actual number is less
+        self.num_hashes = self.num_cards + (self.num_cards * self.num_cards) + 1
+        self.count_table = np.ones((self.num_hashes, 2), dtype=int)
+        self.n_actions = n_actions
+        self.max_stack_len = max_stack_len
+
+    def encode_card(self, card):
+        if card is None:
+            return 60 # should probably be 14 * 4 + 1= 57
+        face_down, suit, rank  = card
+        if face_down:
+            return 61
+
+        return rank + 14 * suit
+
+    def visit(self, obs):
+        """
+        obs -> (bonus, obs_token)
+        """
+        idxs = np.ones([self.n_actions], dtype=int) * (self.num_hashes - 1)
+
+        n_slots = len(obs)
+        max_stack_len = self.max_stack_len
+
+        # (from, to, max_stack_len)
+        for to_slot, (to_slot_type, to_cards) in enumerate(obs):
+            to_enc = self.encode_card(to_cards[-1] if to_cards else None)
+            to_enc *= self.num_cards
+
+            next_cards = obs[(to_slot + 1) % n_slots][1]
+            idxs[to_slot] = self.encode_card(next_cards[-1] if next_cards else None)
+            for from_slot, (from_slot_type, from_cards) in enumerate(obs):
+                for stack_idx, card in enumerate(reversed(from_cards)):
+                    idxs[from_slot * (max_stack_len * n_slots) + to_slot * (max_stack_len) + stack_idx
+                        + n_slots] = self.num_cards + self.encode_card(card) + to_enc
+
+        entries = self.count_table[idxs]
+        res = np.sqrt(np.log(entries[:,1]) / entries[:, 0])
+
+        self.count_table[np.unique(idxs)] += [0, 1]
+        # self.count_table[idxs] += [0, 1]
+        return res, idxs
+
+    def record_action(self, obs_token, action_id):
+        self.count_table[obs_token[action_id], 0] += 1
+
+    def reset(self):
+        assert np.all(self.count_table[:, 0] <= self.count_table[:, 1])
+        pass
+        # self.count_table[:,:] = 1
+
+
 def main():
     debug = True
     update_freq = 4
@@ -509,11 +599,21 @@ def main():
     max_steps = 5000000
     max_steps_per_ep = 10000
     buffer_size = 1000000
-    init_eps = 0.9
-    final_eps = 0.1
-    final_eps_timestep = 100000
-    target_update_freq = 10000
+    # init_eps = 0.9
+    # final_eps = 0.1
+    init_eps = 0.0
+    final_eps = 0.0
+    final_eps_timestep = 1000000
+    target_update_freq = 10000 #5000 # 10000
     max_stack_len = 10
+
+    init_count_factor = 1.0
+    final_count_factor = 0.0
+    final_count_timestep = 1500000
+
+    # factor of 4 = bonus decreases by ~0.2 after the first time an action is tried
+    # count_factor = 0.2 # 1.
+    count_factor = 0.2
 
     env = sol_env.SolEnv('toy-klondike')
     # NOTE(nikita): I'm enabling unlimited redeals because it makes the observations
@@ -522,6 +622,8 @@ def main():
     env.change_options({'Unlimited redeals': True})
     obs = env.reset()
     model = Model(len(obs),max_stack_len)
+    counter = Counter(model.n_actions())
+    # counter = HashCounter(model.n_actions(), model.max_stack_len)
     buff = get_initial_sample(buffer_size, env, model, max_steps_per_ep)
 
     debug_helper = DebugHelper(len(obs), max_stack_len)
@@ -547,30 +649,58 @@ def main():
             else:
                 eps = init_eps + (final_eps-init_eps)*t/final_eps_timestep
 
+            if t >= final_count_timestep:
+                count_factor = final_count_factor
+            else:
+                count_factor = init_count_factor + (final_count_factor-init_count_factor)*t/final_count_timestep
+
             action_mask = model.valid_action_mask(obs)
+
+            # count_bonuses, obs_token = counter.visit(obs)
+            # counts_uniform = True
+            count_bonuses, counts_uniform, obs_token = counter.visit(obs)
+            # if random.random() < 0.01:
+            #     cb = count_bonuses[action_mask > 0]
+            #     print(np.max(cb) - np.mean(cb),
+            #         cb[:2] - np.mean(cb), cb[-50:] - np.mean(cb))
 
             # XXX(nikita): the probabilities assigned to the different strategies
             # are probably suboptimal
-            rnd = random.random()
-            if rnd < 0.2:
+            if random.random() < eps:
                 random_action = True
-                possible_actions = raw_env.get_hint_actions()
-                if not possible_actions:
-                    action_id = (np.random.random(model.n_actions())*action_mask).argmax()
-                else:
-                    action = random.choice(possible_actions)
-                    action_id = model.action_to_action_id(action)
-            elif rnd < eps:
                 action_id = (np.random.random(model.n_actions())*action_mask).argmax()
-                random_action = True
+                # if random.random() < 0.8:
+                #     possible_actions = raw_env.get_hint_actions()
+                # else:
+                #     possible_actions = []
+                #
+                # if not possible_actions:
+                #     action_id = (np.random.random(model.n_actions())*action_mask).argmax()
+                # else:
+                #     action = random.choice(possible_actions)
+                #     action_id = model.action_to_action_id(action)
             else:
                 q_values = model.evaluate_q_values(obs, sess)
-                q_values -= (1-action_mask)*1000
-                action_id = (q_values+np.random.randn(*q_values.shape)*.01).argmax()
-                random_action = False
+                q_values -= (1-action_mask)*1e8
 
+                # valid_qs = q_values[action_mask > 0]
+                # qstat1 = np.mean(valid_qs), np.std(valid_qs)
+
+                q_values += count_factor * count_bonuses
+
+                # valid_qs = count_factor * count_bonuses[action_mask > 0]
+                # qstat2 = np.mean(valid_qs), np.std(valid_qs)
+                #
+                # if random.random() < 0.1:
+                #     print(qstat1, qstat2)
+
+                # action_id = (q_values+np.random.randn(*q_values.shape)*.01).argmax()
+                action_id = q_values.argmax()
+                # random_action = False
+                random_action = not counts_uniform
 
             last_obs = obs
+            counter.record_action(obs_token, action_id)
             action = model.action_id_to_action(action_id, obs)
             obs, rew, done, info = env.step(action)
             episode_reward += rew
@@ -578,11 +708,13 @@ def main():
             buff.insert((last_obs, action_id, obs, rew, done))
             if not random_action:
                 debug_helper.insert(last_obs, q_values, action, rew)
-            # else:
-                # debug_helper.insert_random(last_obs, action, rew)
+            else:
+                debug_helper.insert_random(last_obs, action, rew)
 
             if done or episode_t > max_steps_per_ep:
+                # finished_episode_rewards.append(episode_reward)
                 obs = env.reset()
+                counter.reset()
                 finished_episode_rewards.append(episode_reward)
                 episode_t = 0
                 episode_reward = 0
@@ -603,6 +735,9 @@ def main():
                 mean_rew = np.mean(finished_episode_rewards[-10:])
                 print('mean reward:', mean_rew)
                 print('error:',np.mean(errors[-100:]))
+                print('count factor:', count_factor)
+                print('score:', info['score'])
+                print('latest reward:', finished_episode_rewards[-1:])
 
                 if debug:
                     debug_helper.print_analysis()

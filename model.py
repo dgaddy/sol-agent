@@ -35,9 +35,7 @@ class Buffer(object):
         self.size = size
         self.items = []
         self.item_scores = np.zeros(self.size)
-        self.typical_score = 2.0
         self.index = 0
-        self.stats = []
 
     def insert(self, item, score=None):
         if score is None:
@@ -59,16 +57,9 @@ class Buffer(object):
 
         self.typical_score = max(0.99 * self.typical_score, np.max(td_errors) * 1.2)
 
-    def sample_random(self, k):
-        idxs = np.random.choice(len(self.items), k)
-        return [self.items[i] for i in idxs], idxs, np.ones(k)
-
     def print_debug(self):
         p = self.item_scores[:len(self.items)]
         p = p / np.sum(p) # /= would mutate item scores in place!
-        # p = softmax(2 * p)
-        # p = softmax(0.8 * p)
-        # p = softmax(0.8 * p)
 
         print('Buffer debug statistics:')
         print('  items:', len(self.items))
@@ -87,57 +78,6 @@ class Buffer(object):
         weights = weights ** 0.6
         weights /= np.max(weights)
         return [self.items[i] for i in idxs], idxs, weights
-
-    def sample_weighted_(self, k):
-        p = self.item_scores[:len(self.items)]
-        # p = softmax(0.8 * p) # was 0.2
-        p = softmax(0.8 * p)
-        idxs = np.random.choice(len(self.items), k, p=p)
-
-        weights = 1 / (len(self.items) * np.array([p[i] for i in idxs]))
-        weights = weights ** 0.6 # was 0.5
-        weights /= np.max(weights)
-        return [self.items[i] for i in idxs], idxs, weights
-
-    def sample_td_prio(self, k):
-        # XXX(nikita): no non-uniform sampling for the exploration-bonus case (for now)
-        # return random.sample(self.items, k)
-
-        # prioritized replay based on td-error
-        p = self.item_scores[:len(self.items)] ** 1. + 0.2
-        p /= np.sum(p)
-        idxs = np.random.choice(len(self.items), k, p=p)
-        weights = 1 / (len(self.items) * np.array([p[i] for i in idxs]))
-        weights /= np.max(weights)
-        # print('scores were', [self.item_scores[i] for i in idxs])
-        return [self.items[i] for i in idxs], idxs, weights
-
-        # p = self.item_scores[:len(self.items)]
-        # p = softmax(2 * p)
-        # idxs = np.random.choice(len(self.items), k, p=p)
-        # return [self.items[i] for i in idxs]
-
-        res = random.sample(self.items, k)
-        while np.mean([0. if x[3] < 0 else 1. for x in res]) < 0.5:
-            for i in reversed(range(k)):
-                obs, act, next_obs, rew, done = res[i]
-                if rew < 0:
-                    del res[i]
-            res.extend(random.sample(self.items, k - len(res)))
-
-        return res
-
-        # try:
-        #     self.stats
-        # except AttributeError:
-        #     self.stats = []
-        #
-        # self.stats.append([0. if x[3] < 0 else 1. for x in res])
-        # if len(self.stats) >= 100:
-        #     print('Percent of valid actions sampled:', np.mean(self.stats))
-        #     self.stats.clear()
-        # return res
-
 
 class DebugHelper(object):
     def __init__(self, n_slots, max_stack_len):
@@ -357,9 +297,7 @@ def q_func(visible_ph, suit_ph, rank_ph, pos_ph, seq_len_ph, type_ph, valid_ph, 
 
         context_repeated = tf.tile(tf.expand_dims(global_context, 1), (1, n_slots, 1))
 
-        # TODO(nikita): this should really use the contextual embeddings from the LSTM,
-        # not just the original inputs and the lstm output
-        slot_hiddens = tf.layers.conv1d(tf.concat([slot_reps,context_repeated],2), hidden_size, 1, activation=tf.nn.relu)
+        slot_hiddens = tf.layers.conv1d(tf.concat([contextual_slot_reps,context_repeated],2), hidden_size, 1, activation=tf.nn.relu)
 
         click_slot_adv_values = tf.layers.conv1d(slot_hiddens, 1, 1) # size batch_size by n_slots
 
@@ -457,34 +395,8 @@ class Model(object):
             update_target_fn.append(var_target.assign(var))
         self.update_target_fn = tf.group(*update_target_fn)
 
-        # for boltzmann exploration
-        self.repeat_penalties_ph = tf.placeholder(tf.float32, shape=self.n_actions())
-        self.temperature_ph = tf.placeholder(tf.float32, shape=[], name='temperature_ph')
-        boltzmann_logits = (self.q_values - tf.expand_dims(self.repeat_penalties_ph, 0)) / self.temperature_ph
-
-        greedy_probability = tf.reduce_mean(tf.reduce_max(tf.nn.softmax(boltzmann_logits), 1))
-        greedy_p_ema = tf.train.ExponentialMovingAverage(0.99)
-        greedy_p_ema_apply = greedy_p_ema.apply([greedy_probability])
-        self.avg_greedy_probability = greedy_p_ema.average(greedy_probability)
-
-        with tf.control_dependencies([greedy_p_ema_apply]):
-            self.boltzmann_action = tf.multinomial(boltzmann_logits, num_samples=1)[0, 0]
-
-        self.q_values_single = self.q_values[0,:]
-
     def evaluate_q_values(self, observation, session):
         return session.run(self.q_values, feed_dict=self.feed_dict_from_obs([observation])).squeeze()
-
-    def evaluate_q_values_boltzmann(self, observation, session, temperature, repeat_penalties):
-        return session.run((self.boltzmann_action, self.q_values_single),
-            feed_dict={
-                self.temperature_ph: temperature,
-                self.repeat_penalties_ph: repeat_penalties,
-                **self.feed_dict_from_obs([observation])
-                })
-
-    def get_avg_greedy_prob(self, session):
-        return session.run(self.avg_greedy_probability)
 
     def train_step(self, samples, weights, session):
         learning_rate = .001
@@ -604,7 +516,6 @@ def get_initial_sample(buffer_size, env, model, max_steps_per_ep, initial_sample
         print('gathering samples')
         buff = Buffer(buffer_size)
         counter = StateCounter()
-        repeat_penalties = np.zeros((model.n_actions()))
         loop_preventer = LoopPreventer(model.n_actions())
         obs = env.reset()
         episode_t = 0
@@ -613,124 +524,30 @@ def get_initial_sample(buffer_size, env, model, max_steps_per_ep, initial_sample
             action_mask = model.valid_action_mask(obs)
             loop_preventer_mask, obs_token = loop_preventer.visit(obs)
 
-            action_id = (np.random.random(model.n_actions())*action_mask - repeat_penalties).argmax()
-            # action_id = (np.random.random(model.n_actions())*((action_mask > 0) & loop_preventer_mask)).argmax()
+            action_id = (np.random.random(model.n_actions())*((action_mask > 0) & loop_preventer_mask)).argmax()
             last_obs = obs
             action = model.action_id_to_action(action_id, obs)
             obs, rew, done, info = env.step(action)
 
             counter_bonus, counter_weight = counter.visit(obs)
-            if t > initial_samples/2:
+            if t > 50000:
                 mod_rew = rew + counter_bonus # exploration bonus
             else:
                 mod_rew = rew
 
-            # if random.random() < 0.01:
-            #     print(counter_bonus)
-
             buff.insert((last_obs, action_id, obs, mod_rew, done), counter_weight)
-            # buff.insert((last_obs, action_id, obs, rew, done))
 
-            if obs != last_obs:
-                repeat_penalties[:] = 0
-            else:
-                repeat_penalties[action_id] += 1e8
-
-            # loop_preventer.record_action(obs_token, action_id, (obs == last_obs))
+            loop_preventer.record_action(obs_token, action_id, (obs == last_obs))
 
             if done or episode_t > max_steps_per_ep:
                 obs = env.reset()
                 counter.reset()
-                repeat_penalties[:] = 0
-                # loop_preventer.reset()
+                loop_preventer.reset()
                 episode_t = 0
 
         with open(sample_file, 'wb') as f:
             pickle.dump(buff, f)
         return buff
-
-class Counter:
-    def __init__(self, n_actions):
-        self.table = {}
-        self.n_actions = n_actions
-
-    def hash_obs(self, obs):
-        return hash(tuple([(a, tuple(b)) for a,b in obs]))
-
-    def visit(self, obs):
-        """
-        obs -> (bonus, is_uniform, obs_token)
-        """
-        h = self.hash_obs(obs)
-        if h not in self.table:
-            self.table[h] = np.ones(self.n_actions, dtype=int)
-            uniform = True
-        else:
-            uniform = False
-
-        entry = self.table[h]
-        res = np.sqrt(np.log(np.sum(entry)) / entry) # UCB
-        return res, uniform, h
-
-    def record_action(self, obs_token, action_id):
-        assert obs_token in self.table
-        self.table[obs_token][action_id] += 1
-
-    def reset(self):
-        self.table = {}
-
-class HashCounter:
-    def __init__(self, n_actions, max_stack_len):
-        self.num_cards = 64 # TODO: actual number is less
-        self.num_hashes = self.num_cards + (self.num_cards * self.num_cards) + 1
-        self.count_table = np.ones((self.num_hashes, 2), dtype=int)
-        self.n_actions = n_actions
-        self.max_stack_len = max_stack_len
-
-    def encode_card(self, card):
-        if card is None:
-            return 60 # should probably be 14 * 4 + 1= 57
-        face_down, suit, rank  = card
-        if face_down:
-            return 61
-
-        return rank + 14 * suit
-
-    def visit(self, obs):
-        """
-        obs -> (bonus, obs_token)
-        """
-        idxs = np.ones([self.n_actions], dtype=int) * (self.num_hashes - 1)
-
-        n_slots = len(obs)
-        max_stack_len = self.max_stack_len
-
-        # (from, to, max_stack_len)
-        for to_slot, (to_slot_type, to_cards) in enumerate(obs):
-            to_enc = self.encode_card(to_cards[-1] if to_cards else None)
-            to_enc *= self.num_cards
-
-            next_cards = obs[(to_slot + 1) % n_slots][1]
-            idxs[to_slot] = self.encode_card(next_cards[-1] if next_cards else None)
-            for from_slot, (from_slot_type, from_cards) in enumerate(obs):
-                for stack_idx, card in enumerate(reversed(from_cards)):
-                    idxs[from_slot * (max_stack_len * n_slots) + to_slot * (max_stack_len) + stack_idx
-                        + n_slots] = self.num_cards + self.encode_card(card) + to_enc
-
-        entries = self.count_table[idxs]
-        res = np.sqrt(np.log(entries[:,1]) / entries[:, 0])
-
-        self.count_table[np.unique(idxs)] += [0, 1]
-        # self.count_table[idxs] += [0, 1]
-        return res, idxs
-
-    def record_action(self, obs_token, action_id):
-        self.count_table[obs_token[action_id], 0] += 1
-
-    def reset(self):
-        assert np.all(self.count_table[:, 0] <= self.count_table[:, 1])
-        pass
-        # self.count_table[:,:] = 1
 
 class StateCounter:
     def __init__(self):
@@ -776,7 +593,7 @@ class StateCounter:
         self.total += 1
 
         if self.total < 50000:
-            p_weight = 0.25
+            p_weight = 50000
         else:
             p_weight = self.total / self.table[h]
 
@@ -787,9 +604,6 @@ class StateCounter:
             return 0.25 * np.sqrt(np.log(self.total) / self.table[h]), p_weight
         else:
             return 0, p_weight # Only give bonus when visiting state for the first time
-
-        # return 0.1 * np.sqrt(np.log(self.total) / self.table[h]) # TODO: move 0.1 constant elsewhere
-        # return 1. / np.sqrt(self.table[h])
 
     def reset(self):
         self.unique_visited = set()
@@ -860,26 +674,10 @@ def main():
     batch_size = 32
     max_steps = 5000000
     max_steps_per_ep = 10000
-    buffer_size = 1000000
-    # init_eps = 0.9
-    # final_eps = 0.1
-    init_eps = 0.0
-    final_eps = 0.0
+    buffer_size = 100000
     final_eps_timestep = 1000000
-    target_update_freq = 5000 # 10000
+    target_update_freq = 5000
     max_stack_len = 10
-
-    init_count_factor = 1.0
-    final_count_factor = 0.0
-    final_count_timestep = 1500000
-
-    init_temperature = 1. / 7.
-    final_temperature = 1. / 70.
-    final_temperature_timestep = 100000
-
-    # factor of 4 = bonus decreases by ~0.2 after the first time an action is tried
-    # count_factor = 0.2 # 1.
-    count_factor = 0.2
 
     env = sol_env.SolEnv('toy-klondike')
     # NOTE(nikita): I'm enabling unlimited redeals because it makes the observations
@@ -888,10 +686,8 @@ def main():
     env.change_options({'Unlimited redeals': True})
     obs = env.reset()
     model = Model(len(obs),max_stack_len)
-    # counter = Counter(model.n_actions())
-    # counter = HashCounter(model.n_actions(), model.max_stack_len)
     counter = StateCounter()
-    buff = get_initial_sample(buffer_size, env, model, max_steps_per_ep, 100000)
+    buff = get_initial_sample(buffer_size, env, model, max_steps_per_ep, 150000)
     for buf_obs, _, _, _, _ in buff.items:
         counter.visit(obs)
     print('Done re-visiting from buffer')
@@ -909,7 +705,6 @@ def main():
         env = gym.wrappers.Monitor(env, os.path.join('/tmp/sol_vid', "gym"), force=True,
             video_callable=lambda num: (num % 1000 < 10) or (num % 10) == 0)
         obs = env.reset()
-        # repeat_penalties = np.zeros((model.n_actions())) # prevent making the same action in the same state
         tf.global_variables_initializer().run()
         # saver.restore(sess, 'models/model-837000')
 
@@ -921,88 +716,16 @@ def main():
         for t in range(1,max_steps+1):
             episode_t += 1
 
-            if t >= final_eps_timestep:
-                eps = final_eps
-            else:
-                eps = init_eps + (final_eps-init_eps)*t/final_eps_timestep
-
-            if t >= final_count_timestep:
-                count_factor = final_count_factor
-            else:
-                count_factor = init_count_factor + (final_count_factor-init_count_factor)*t/final_count_timestep
-
-            if t >= final_temperature_timestep:
-                temperature = final_temperature
-            else:
-                temperature = init_temperature + (final_temperature-init_temperature)*t/final_temperature_timestep
-
             action_mask = model.valid_action_mask(obs)
 
-            # count_bonuses, obs_token = counter.visit(obs)
-            # counts_uniform = True
-            # count_bonuses, counts_uniform, obs_token = counter.visit(obs)
-            # if random.random() < 0.01:
-            #     cb = count_bonuses[action_mask > 0]
-            #     print(np.max(cb) - np.mean(cb),
-            #         cb[:2] - np.mean(cb), cb[-50:] - np.mean(cb))
+            q_values = model.evaluate_q_values(obs, sess)
+            q_values -= (1-action_mask)*1e8
+            loop_preventer_mask, obs_token = loop_preventer.visit(obs)
 
-            # if True: # boltzmann exploration
-            #     random_action = False
-            #     action_id, q_values = model.evaluate_q_values_boltzmann(obs, sess, temperature, repeat_penalties)
-
-            # XXX(nikita): the probabilities assigned to the different strategies
-            # are probably suboptimal
-            # if random.random() < eps:
-            #     random_action = True
-            #     action_id = (np.random.random(model.n_actions())*action_mask).argmax()
-            #     # if random.random() < 0.8:
-            #     #     possible_actions = raw_env.get_hint_actions()
-            #     # else:
-            #     #     possible_actions = []
-            #     #
-            #     # if not possible_actions:
-            #     #     action_id = (np.random.random(model.n_actions())*action_mask).argmax()
-            #     # else:
-            #     #     action = random.choice(possible_actions)
-            #     #     action_id = model.action_to_action_id(action)
-            # else:
-            #     q_values = model.evaluate_q_values(obs, sess)
-            #     q_values -= (1-action_mask)*1e8
-            #
-            #     # valid_qs = q_values[action_mask > 0]
-            #     # qstat1 = np.mean(valid_qs), np.std(valid_qs)
-            #
-            #     q_values += count_factor * count_bonuses
-            #
-            #     # valid_qs = count_factor * count_bonuses[action_mask > 0]
-            #     # qstat2 = np.mean(valid_qs), np.std(valid_qs)
-            #     #
-            #     # if random.random() < 0.1:
-            #     #     print(qstat1, qstat2)
-            #
-            #     # action_id = (q_values+np.random.randn(*q_values.shape)*.01).argmax()
-            #     action_id = q_values.argmax()
-            #     # random_action = False
-            #     random_action = not counts_uniform
-            #
-            # if True: # argmax, but with repeat_penalties
-            #     q_values = model.evaluate_q_values(obs, sess)
-            #     q_values -= (1-action_mask)*1e8
-            #     action_id = (q_values - repeat_penalties).argmax()
-            #     random_action = (repeat_penalties[q_values.argmax()] > 0)
-
-            if True: # loop preventer strategy
-                q_values = model.evaluate_q_values(obs, sess)
-                q_values -= (1-action_mask)*1e8
-                loop_preventer_mask, obs_token = loop_preventer.visit(obs)
-
-                action_id = (q_values - (1 - loop_preventer_mask) * 1e8).argmax()
-                random_action = (not loop_preventer_mask[q_values.argmax()])
-
-            # repeat_penalties[action_id] += 1e8
+            action_id = (q_values - (1 - loop_preventer_mask) * 1e8).argmax()
+            random_action = (not loop_preventer_mask[q_values.argmax()])
 
             last_obs = obs
-            # counter.record_action(obs_token, action_id)
             action = model.action_id_to_action(action_id, obs)
             obs, rew, done, info = env.step(action)
             episode_reward += rew
@@ -1012,8 +735,6 @@ def main():
             if random.random() < 0.01:
                 print(counter_bonus, counter_weight)
 
-            # if obs != last_obs:
-            #     repeat_penalties[:] = 0
             loop_preventer.record_action(obs_token, action_id, (obs == last_obs))
 
             buff.insert((last_obs, action_id, obs, mod_rew, done), counter_weight)
@@ -1029,14 +750,11 @@ def main():
                 print('============================================')
                 print('iteration:', t)
                 print('num updates:', num_param_updates)
-                print('epsilon greedy:', eps)
                 mean_rew = np.mean(finished_episode_rewards[-10:])
                 print('mean reward:', mean_rew)
                 print('error:',np.mean(errors[-100:]))
-                print('count factor:', count_factor)
                 print('score:', info['score'])
                 print('latest reward:', finished_episode_rewards[-1:])
-                print('avg greedy prob:', model.get_avg_greedy_prob(sess))
 
                 unique_states, total_states = debug_counter.get_counts()
                 debug_counter.reset()
@@ -1049,7 +767,6 @@ def main():
                 obs = env.reset()
                 counter.reset()
                 debug_helper.reset()
-                # repeat_penalties[:] = 0
                 loop_preventer.reset()
                 episode_t = 0
                 episode_reward = 0
@@ -1059,13 +776,12 @@ def main():
                 saver.save(sess, 'models/model', global_step=t)
 
             if t % update_freq == 0:
-                # if t < 2000:
-                    # examples, example_idxs, example_weights = buff.sample_random(batch_size)
-                # else:
                 examples, example_idxs, example_weights = buff.sample(batch_size)
                 error, example_errors = model.train_step(examples, example_weights, sess)
                 errors.append(error)
-                buff.reprioritize(example_idxs, example_errors)
+                # TODO(nikita): consider recalculating counter weights for these
+                # examples
+                # buff.reprioritize(example_idxs, example_errors)
                 num_param_updates += 1
 
             if num_param_updates % target_update_freq == 0:

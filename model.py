@@ -600,10 +600,10 @@ class StateCounter:
         hu = self.unique_hash_obs(obs)
         if hu not in self.unique_visited:
             self.unique_visited.add(hu)
-            # TODO: move 0.25 constant elsewhere
-            return 0.25 * np.sqrt(np.log(self.total) / self.table[h]), p_weight
+            # TODO: move multiplicative constant elsewhere
+            return 0.25 * np.sqrt(np.log(self.total) / self.table[h]) - 1., p_weight
         else:
-            return 0, p_weight # Only give bonus when visiting state for the first time
+            return -1., p_weight # Only give bonus when visiting state for the first time
 
     def reset(self):
         self.unique_visited = set()
